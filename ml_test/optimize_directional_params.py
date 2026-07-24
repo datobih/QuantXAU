@@ -1,0 +1,552 @@
+"""
+Focused Directional Optimizer — Base Features + Optuna
+========================================================
+Fixed:   mode=directional, rf_depth=20, rf_trees=50 (fast)
+Optimize: target, stop, horizon, rf_threshold  (4 params)
+Features: 26 base (no HTF)
+Walk-forward: train 60% (50% subsample), test 40%
+Objective: t-statistic (spread-adjusted)
+"""
+
+import numpy as np
+import pandas as pd
+import numba as nb
+import optuna
+import time
+import warnings
+import os
+
+from sklearn.ensemble import RandomForestClassifier
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+warnings.filterwarnings('ignore')
+
+DATA_PATH  = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw', 'XAUUSDD.csv')
+N_TRIALS   = 200
+SPREAD     = 0.30
+RF_DEPTH   = 20
+RF_TREES   = 50   # fast search (retrain best with 200 after)
+
+
+# ── Feature engineering (exact copy from hedging_strategy_strict_old.py) ─────
+def create_microstructure_features(df):
+    df = df.copy()
+
+    # Price structure
+    df['range'] = df['High'] - df['Low']
+    df['body'] = df['Close'] - df['Open']
+    df['abs_body'] = abs(df['body'])
+    df['upper_wick'] = df['High'] - df[['Open','Close']].max(axis=1)
+    df['lower_wick'] = df[['Open','Close']].min(axis=1) - df['Low']
+    df['body_pct'] = df['abs_body'] / (df['range'] + 1e-10)
+
+    # Order flow
+    df['close_position'] = (df['Close'] - df['Low']) / (df['range'] + 1e-10)
+    df['directional_flow'] = df['body'] / df['Close']
+    df['flow_3'] = df['directional_flow'].rolling(3).sum()
+    df['flow_5'] = df['directional_flow'].rolling(5).sum()
+    df['flow_10'] = df['directional_flow'].rolling(10).sum()
+    df['flow_momentum'] = df['flow_3'] - df['flow_5'].shift(2)
+
+    # Imbalance
+    df['buy_imbalance'] = ((df['body'] > 0) & (df['body_pct'] > 0.6) & (df['close_position'] > 0.7)).astype(float)
+    df['sell_imbalance'] = ((df['body'] < 0) & (df['body_pct'] > 0.6) & (df['close_position'] < 0.3)).astype(float)
+    df['imbalance_3'] = (df['buy_imbalance'] - df['sell_imbalance']).rolling(3).sum()
+    df['imbalance_5'] = (df['buy_imbalance'] - df['sell_imbalance']).rolling(5).sum()
+
+    # Momentum consistency
+    df['is_up'] = (df['Close'] > df['Open']).astype(int)
+    df['up_count_3'] = df['is_up'].rolling(3).sum()
+    df['up_count_5'] = df['is_up'].rolling(5).sum()
+    df['consistency_3'] = df['up_count_3'].apply(lambda x: max(x, 3-x))
+    df['consistency_5'] = df['up_count_5'].apply(lambda x: max(x, 5-x))
+
+    # Volatility
+    df['atr_3'] = df['range'].rolling(3).mean()
+    df['atr_10'] = df['range'].rolling(10).mean()
+    df['atr_20'] = df['range'].rolling(20).mean()
+    df['vol_ratio'] = df['atr_3'] / (df['atr_10'] + 1e-10)
+    df['vol_expansion'] = (df['range'] > df['atr_10'] * 1.2).astype(int)
+    df['vol_contraction'] = (df['range'] < df['atr_10'] * 0.7).astype(int)
+
+    # Trend structure
+    df['ema_8'] = df['Close'].ewm(span=8).mean()
+    df['ema_21'] = df['Close'].ewm(span=21).mean()
+    df['trend_align'] = ((df['Close'] > df['ema_8']) & (df['ema_8'] > df['ema_21'])).astype(int) - \
+                        ((df['Close'] < df['ema_8']) & (df['ema_8'] < df['ema_21'])).astype(int)
+    df['dist_ema8'] = (df['Close'] - df['ema_8']) / df['Close']
+
+    # Support/Resistance
+    df['high_10'] = df['High'].rolling(10).max()
+    df['low_10'] = df['Low'].rolling(10).min()
+    df['at_high'] = (df['Close'] >= df['high_10'].shift(1) * 0.9999).astype(int)
+    df['at_low'] = (df['Close'] <= df['low_10'].shift(1) * 1.0001).astype(int)
+
+    # Rejection patterns
+    df['upper_reject'] = (df['upper_wick'] > df['abs_body'] * 2).astype(int)
+    df['lower_reject'] = (df['lower_wick'] > df['abs_body'] * 2).astype(int)
+
+    # Size patterns
+    df['big_body'] = (df['abs_body'] > df['abs_body'].rolling(10).mean() * 1.5).astype(int)
+    df['small_body'] = (df['abs_body'] < df['abs_body'].rolling(10).mean() * 0.5).astype(int)
+
+    # Deeper flow features
+    df['flow_15'] = df['directional_flow'].rolling(15).sum()
+    df['flow_20'] = df['directional_flow'].rolling(20).sum()
+    df['flow_accel'] = df['flow_3'] - df['flow_3'].shift(3)
+    df['flow_accel_5'] = df['flow_5'] - df['flow_5'].shift(5)
+    df['abs_flow_3'] = df['flow_3'].abs()
+    df['abs_flow_5'] = df['flow_5'].abs()
+    df['abs_flow_10'] = df['flow_10'].abs()
+    df['flow_divergence'] = (df['flow_3'] * df['flow_10'] < 0).astype(int)
+
+    # Flow quality
+    df['consecutive_up'] = df['is_up'].groupby((df['is_up'] != df['is_up'].shift()).cumsum()).cumcount() + 1
+    df['consecutive_up'] = df['consecutive_up'] * df['is_up']
+    df['consecutive_down'] = (1 - df['is_up']).groupby(((1-df['is_up']) != (1-df['is_up']).shift()).cumsum()).cumcount() + 1
+    df['consecutive_down'] = df['consecutive_down'] * (1 - df['is_up'])
+    df['max_consecutive'] = df[['consecutive_up', 'consecutive_down']].max(axis=1)
+    df['flow_efficiency'] = df['abs_body'] / (df['range'] + 1e-10)
+    df['flow_eff_3'] = df['flow_efficiency'].rolling(3).mean()
+    df['flow_eff_5'] = df['flow_efficiency'].rolling(5).mean()
+
+    # Volatility regime
+    df['atr_roc'] = (df['atr_3'] - df['atr_3'].shift(3)) / (df['atr_3'].shift(3) + 1e-10)
+    df['vol_breakout'] = df['range'] / (df['atr_20'] + 1e-10)
+    df['range_min_5'] = df['range'].rolling(5).min()
+    df['range_max_5'] = df['range'].rolling(5).max()
+    df['range_squeeze'] = df['range_min_5'] / (df['range_max_5'] + 1e-10)
+
+    # Distance features
+    df['abs_dist_ema8'] = df['dist_ema8'].abs()
+    df['dist_ema21'] = (df['Close'] - df['ema_21']) / df['Close']
+    df['abs_dist_ema21'] = df['dist_ema21'].abs()
+    df['ema_spread'] = (df['ema_8'] - df['ema_21']) / df['Close']
+    df['abs_ema_spread'] = df['ema_spread'].abs()
+
+    # Combo features
+    df['combo_abs_flow_vol'] = df['abs_flow_5'] * df['vol_ratio']
+    df['combo_eff_flow'] = df['flow_eff_3'] * df['abs_flow_3']
+    df['combo_consecutive_body'] = df['max_consecutive'] * df['body_pct']
+    df['combo_atr_roc_accel'] = df['atr_roc'] * df['flow_accel'].abs()
+    df['combo_squeeze_flow'] = (1 - df['range_squeeze']) * df['abs_flow_3']
+    df['combo_dist_flow'] = df['abs_dist_ema8'] * df['abs_flow_5']
+    df['combo_flow_trend'] = df['flow_momentum'] * df['trend_align']
+    df['combo_vol_imbalance'] = df['vol_ratio'] * df['imbalance_3']
+    df['combo_consistency_position'] = df['consistency_5'] * df['close_position']
+    df['combo_body_reject'] = df['big_body'] * (df['lower_reject'] - df['upper_reject'])
+    df['combo_trend_volatility'] = df['trend_align'] * df['vol_expansion']
+    df['combo_imbalance_momentum'] = df['imbalance_5'] * df['flow_5']
+    df['combo_position_consistency'] = df['close_position'] * df['consistency_3']
+    df['combo_vol_flow'] = df['vol_ratio'] * df['flow_3']
+
+    return df.dropna()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NUMBA LABELING — Directional only
+# ══════════════════════════════════════════════════════════════════════════════
+
+@nb.njit(cache=True)
+def label_directional(closes, highs, lows, horizon, target, stop):
+    """
+    Directional labeling: for each bar, does price hit TP or SL first?
+    Returns: 1=LONG TP, 2=SHORT TP, 0=neither
+    """
+    n = len(closes)
+    labels = np.zeros(n, dtype=np.int32)
+
+    for i in range(n - horizon):
+        entry = closes[i]
+        long_tp  = entry + target
+        long_sl  = entry - stop
+        short_tp = entry - target
+        short_sl = entry + stop
+
+        for j in range(i + 1, min(i + horizon + 1, n)):
+            if highs[j] >= long_tp:
+                labels[i] = 1
+                break
+            if lows[j] <= short_tp:
+                labels[i] = 2
+                break
+            if lows[j] <= long_sl:
+                for k in range(j, min(i + horizon + 1, n)):
+                    if lows[k] <= short_tp:
+                        labels[i] = 2
+                        break
+                    if highs[k] >= short_sl:
+                        break
+                break
+            if highs[j] >= short_sl:
+                for k in range(j, min(i + horizon + 1, n)):
+                    if highs[k] >= long_tp:
+                        labels[i] = 1
+                        break
+                    if lows[k] <= long_sl:
+                        break
+                break
+
+    return labels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EVALUATION — Directional only
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_directional(rf_probs_long, rf_probs_short, dir_labels,
+                         target, stop, threshold):
+    """Directional: LONG when prob_long >= th, SHORT when prob_short >= th."""
+    long_mask = rf_probs_long >= threshold
+    short_mask = rf_probs_short >= threshold
+
+    trades_pnl = []
+    trade_types = []
+
+    for i in np.where(long_mask)[0]:
+        if dir_labels[i] == 1:
+            trades_pnl.append(target - SPREAD)
+            trade_types.append(1)
+        elif dir_labels[i] == 2:
+            trades_pnl.append(-stop - SPREAD)
+            trade_types.append(-1)
+        else:
+            trades_pnl.append(-SPREAD)
+            trade_types.append(0)
+
+    for i in np.where(short_mask)[0]:
+        if dir_labels[i] == 2:
+            trades_pnl.append(target - SPREAD)
+            trade_types.append(1)
+        elif dir_labels[i] == 1:
+            trades_pnl.append(-stop - SPREAD)
+            trade_types.append(-1)
+        else:
+            trades_pnl.append(-SPREAD)
+            trade_types.append(0)
+
+    if len(trades_pnl) < 10:
+        return None
+
+    pnl = np.array(trades_pnl)
+    types = np.array(trade_types)
+    n = len(pnl)
+
+    wins = int((types == 1).sum())
+    losses = int((types == -1).sum())
+    timeouts = int((types == 0).sum())
+
+    total = float(pnl.sum())
+    avg = float(pnl.mean())
+    std = float(pnl.std()) if n > 1 else 1e-10
+    t_stat = avg / (std / np.sqrt(n) + 1e-10)
+    sharpe = avg / (std + 1e-10) * np.sqrt(252)
+
+    cum = np.cumsum(pnl)
+    max_dd = float(np.min(cum - np.maximum.accumulate(cum)))
+
+    gross_w = float(pnl[pnl > 0].sum()) if (pnl > 0).any() else 0.0
+    gross_l = float(np.abs(pnl[pnl < 0].sum())) if (pnl < 0).any() else 1e-10
+    pf = gross_w / gross_l
+
+    avg_win = float(pnl[pnl > 0].mean()) if (pnl > 0).any() else 0.0
+    avg_loss = float(pnl[pnl < 0].mean()) if (pnl < 0).any() else -1.0
+    rr = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
+
+    return {
+        'setups': n, 'wins': wins, 'losses': losses, 'timeouts': timeouts,
+        'wr': round(wins / n * 100, 1),
+        'total_pnl': round(total, 2), 'avg_pnl': round(avg, 4),
+        'avg_win': round(avg_win, 2), 'avg_loss': round(avg_loss, 2),
+        'rr': round(rr, 2),
+        't_stat': round(t_stat, 2), 'sharpe': round(sharpe, 2),
+        'pf': round(pf, 2), 'max_dd': round(max_dd, 2),
+        'n_long': int(long_mask.sum()), 'n_short': int(short_mask.sum()),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PIPELINE — Directional only, fixed RF depth/trees
+# ══════════════════════════════════════════════════════════════════════════════
+
+BASE_FEATURES = [
+    'abs_ema_spread', 'abs_flow_10', 'abs_flow_3', 'abs_flow_5',
+    'abs_dist_ema21', 'combo_dist_flow', 'abs_dist_ema8',
+    'flow_momentum', 'ema_spread', 'flow_20',
+    'flow_3', 'flow_5', 'flow_10', 'trend_align', 'imbalance_3',
+    'imbalance_5', 'close_position', 'vol_ratio', 'vol_expansion',
+    'consistency_3', 'consistency_5', 'dist_ema8',
+    'combo_flow_trend', 'combo_vol_imbalance',
+    'combo_imbalance_momentum', 'combo_vol_flow',
+]
+
+FEATURE_NAMES = BASE_FEATURES
+
+
+def run_pipeline(df_feat, split_idx, target, stop, horizon, rf_threshold):
+    """Label -> train RF -> predict -> evaluate. Fixed depth/trees."""
+    closes = df_feat['Close'].values.astype(np.float64)
+    highs  = df_feat['High'].values.astype(np.float64)
+    lows   = df_feat['Low'].values.astype(np.float64)
+
+    labels = label_directional(closes, highs, lows, horizon, target, stop)
+
+    df_lab = df_feat.copy()
+    df_lab['label'] = labels
+
+    train = df_lab.iloc[:split_idx]
+    test  = df_lab.iloc[split_idx:]
+
+    # Subsample train for speed (50%)
+    train = train.sample(frac=0.9, random_state=42)
+
+    y_train = train['label'].values
+    X_train = train[FEATURE_NAMES].fillna(0)
+    X_test  = test[FEATURE_NAMES].fillna(0)
+
+    rf = RandomForestClassifier(
+        n_estimators=RF_TREES, max_depth=RF_DEPTH,
+        random_state=42, n_jobs=-1,
+    )
+    rf.fit(X_train, y_train)
+
+    proba = rf.predict_proba(X_test)
+    classes = rf.classes_
+
+    long_idx  = np.where(classes == 1)[0]
+    short_idx = np.where(classes == 2)[0]
+    if len(long_idx) == 0 or len(short_idx) == 0:
+        return None
+
+    probs_long  = proba[:, long_idx[0]]
+    probs_short = proba[:, short_idx[0]]
+
+    return evaluate_directional(probs_long, probs_short,
+                                test['label'].values,
+                                target, stop, rf_threshold)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OPTUNA OBJECTIVE — 4 params only
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_objective(df_feat, split_idx):
+    def objective(trial):
+        target  = trial.suggest_float('target', 2.0, 8.0, step=0.5)
+        stop    = trial.suggest_float('stop', 0.50, 3.0, step=0.25)
+        horizon = trial.suggest_int('horizon', 15, 60, step=5)
+        rf_th   = trial.suggest_float('rf_threshold', 0.40, 0.90, step=0.05)
+
+        # Sanity: win must be positive after spread
+        if target <= SPREAD:
+            return -999.0
+
+        result = run_pipeline(df_feat, split_idx, target, stop, horizon, rf_th)
+
+        if result is None or result['setups'] < 30:
+            return -999.0
+
+        trial.set_user_attr('wr', result['wr'])
+        trial.set_user_attr('rr', result['rr'])
+        trial.set_user_attr('total_pnl', result['total_pnl'])
+        trial.set_user_attr('avg_pnl', result['avg_pnl'])
+        trial.set_user_attr('pf', result['pf'])
+        trial.set_user_attr('sharpe', result['sharpe'])
+        trial.set_user_attr('max_dd', result['max_dd'])
+        trial.set_user_attr('setups', result['setups'])
+        trial.set_user_attr('wins', result['wins'])
+        trial.set_user_attr('losses', result['losses'])
+
+        return result['t_stat']
+
+    return objective
+
+
+# ── Reporting ────────────────────────────────────────────────────────────────
+def print_metrics(m, label=''):
+    if m is None:
+        print(f'  {label}: No valid trades')
+        return
+    print(f'  {label} [DIRECTIONAL]')
+    print(f'    Setups:    {m["setups"]:>5d}   (W:{m["wins"]} L:{m["losses"]} T:{m["timeouts"]})')
+    print(f'    Win Rate:  {m["wr"]:>5.1f}%')
+    print(f'    Avg Win:   ${m["avg_win"]:>+7.2f}  |  Avg Loss: ${m["avg_loss"]:>+7.2f}  '
+          f'|  RR: {m["rr"]:.2f}  (incl 1x${SPREAD} spread)')
+    print(f'    Total P&L: ${m["total_pnl"]:>9,.2f}')
+    print(f'    Avg P&L:   ${m["avg_pnl"]:>9.4f} per trade')
+    print(f'    t-stat:    {m["t_stat"]:>6.2f}')
+    print(f'    PF:        {m["pf"]:>6.2f}')
+    print(f'    Sharpe:    {m["sharpe"]:>6.2f}')
+    print(f'    MaxDD:     ${m["max_dd"]:>9,.2f}')
+    print(f'    Entries:   {m["n_long"]} long, {m["n_short"]} short')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+    t0 = time.time()
+    print('=' * 72)
+    print('  FOCUSED DIRECTIONAL OPTIMIZER -- BASE FEATURES')
+    print(f'  Fixed: depth={RF_DEPTH}, trees={RF_TREES} | '
+          f'Optimize: target, stop, horizon, threshold')
+    print(f'  {N_TRIALS} trials | {len(FEATURE_NAMES)} base features')
+    print('=' * 72)
+
+    # ── Load ──
+    print('\n  Loading data...')
+    df = pd.read_csv(
+        DATA_PATH, sep='\t',
+        names=['Date', 'Time', 'Open', 'High', 'Low', 'Close',
+               'TickVol', 'Vol', 'Spread'],
+    )
+    df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'],
+                                    format='%Y.%m.%d %H:%M:%S')
+    df.set_index('Datetime', inplace=True)
+    df = df[['Open', 'High', 'Low', 'Close']].copy()
+    print(f'  {len(df):,} bars: {df.index[0]} -> {df.index[-1]}')
+
+    # ── Features ──
+    print('  Engineering 1min features...')
+    df = create_microstructure_features(df)
+    print(f'  {len(df):,} bars after warmup')
+
+    split = int(len(df) * 0.6)
+    print(f'  Train: {split:,} | Test: {len(df)-split:,}')
+
+    # ── Warm up Numba ──
+    print('\n  Compiling Numba...')
+    c = df['Close'].values[:2000].astype(np.float64)
+    h = df['High'].values[:2000].astype(np.float64)
+    l = df['Low'].values[:2000].astype(np.float64)
+    _ = label_directional(c, h, l, 30, 3.0, 1.5)
+    print('  Done.')
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  BASELINE (original params: TGT=$2, SL=$0.50, HOR=15, TH=0.40)
+    # ══════════════════════════════════════════════════════════════════════
+    print(f'\n{"="*72}')
+    print('  BASELINE (TGT=$2, SL=$0.50, HOR=15, TH=0.40)')
+    print(f'{"="*72}')
+
+    base = run_pipeline(df, split, 2.0, 0.50, 15, 0.40)
+    print_metrics(base, 'Original params')
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  OPTUNA OPTIMIZATION (4 params, parallel)
+    # ══════════════════════════════════════════════════════════════════════
+    print(f'\n{"="*72}')
+    print(f'  OPTUNA OPTIMIZATION ({N_TRIALS} trials, directional, parallel)')
+    print(f'  Search: target=[2-8], stop=[0.5-3], horizon=[15-60], threshold=[0.4-0.9]')
+    print(f'  Speed: RF_TREES={RF_TREES} (fast), 50% train subsample')
+    print(f'{"="*72}')
+
+    objective = make_objective(df, split)
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+
+    t1 = time.time()
+    study.optimize(
+        objective, n_trials=N_TRIALS, n_jobs=1, show_progress_bar=True,
+    )
+    elapsed = time.time() - t1
+
+    bp = study.best_params
+    print(f'\n\n  Completed {N_TRIALS} trials in {elapsed:.1f}s '
+          f'({elapsed/N_TRIALS:.1f}s/trial)')
+
+    print(f'\n  BEST PARAMETERS:')
+    for k, v in bp.items():
+        print(f'    {k:20s}: {v}')
+    rr = (bp['target'] - SPREAD) / (bp['stop'] + SPREAD)
+    print(f'    {"actual_rr":20s}: {rr:.2f}')
+
+    # ── Evaluate best ──
+    print(f'\n{"─"*72}')
+    print('  OPTIMIZED RESULTS')
+    print(f'{"─"*72}')
+    opt = run_pipeline(df, split, bp['target'], bp['stop'],
+                       bp['horizon'], bp['rf_threshold'])
+    print_metrics(opt, 'Test (40%) -- OPTIMIZED')
+
+    # ── Comparison ──
+    if base and opt:
+        print(f'\n{"─"*72}')
+        print('  BASELINE vs OPTIMIZED')
+        print(f'{"─"*72}')
+        print(f'  {"Metric":<15s} {"Baseline":>10s} {"Optimized":>10s}')
+        print(f'  {"─"*40}')
+        for k, lab in [('wr', 'Win Rate %'), ('rr', 'Reward:Risk'),
+                       ('total_pnl', 'Total P&L $'), ('avg_pnl', 'Avg P&L $'),
+                       ('t_stat', 't-stat'), ('pf', 'Profit Factor'),
+                       ('max_dd', 'Max DD $'), ('setups', 'Setups')]:
+            bv = base.get(k, 'N/A')
+            ov = opt.get(k, 'N/A')
+            print(f'  {lab:<15s} {str(bv):>10s} {str(ov):>10s}')
+
+    # ── All profitable trials ──
+    print(f'\n{"="*72}')
+    print('  ALL PROFITABLE TRIALS (ranked by t-stat)')
+    print(f'{"="*72}\n')
+
+    trials_df = study.trials_dataframe()
+    trials_df = trials_df[trials_df['value'] > 0]
+    trials_df = trials_df.sort_values('value', ascending=False).reset_index(drop=True)
+
+    rows = []
+    for _, row in trials_df.iterrows():
+        rows.append({
+            'rank': len(rows) + 1,
+            't_stat': row['value'],
+            'TGT': row['params_target'],
+            'SL': row['params_stop'],
+            'horizon': int(row['params_horizon']),
+            'threshold': row['params_rf_threshold'],
+            'WR%': row.get('user_attrs_wr', 0),
+            'RR': row.get('user_attrs_rr', 0),
+            'total_pnl': row.get('user_attrs_total_pnl', 0),
+            'avg_pnl': row.get('user_attrs_avg_pnl', 0),
+            'PF': row.get('user_attrs_pf', 0),
+            'sharpe': row.get('user_attrs_sharpe', 0),
+            'max_dd': row.get('user_attrs_max_dd', 0),
+            'setups': int(row.get('user_attrs_setups', 0)),
+            'wins': int(row.get('user_attrs_wins', 0)),
+            'losses': int(row.get('user_attrs_losses', 0)),
+        })
+    results_df = pd.DataFrame(rows)
+
+    print(f'  {"#":>3s}  {"t":>6s}  {"TGT":>5s}  {"SL":>5s}  '
+          f'{"HOR":>3s}  {"TH":>4s}  {"WR%":>5s}  {"RR":>5s}  '
+          f'{"P&L":>9s}  {"PF":>5s}  {"Setups":>6s}  {"W":>4s}  {"L":>4s}')
+    print(f'  {"─"*80}')
+    for _, r in results_df.iterrows():
+        print(f'  {int(r["rank"]):3d}  {r["t_stat"]:6.2f}  '
+              f'${r["TGT"]:4.1f}  ${r["SL"]:4.2f}  '
+              f'{int(r["horizon"]):3d}  {r["threshold"]:4.2f}  '
+              f'{r["WR%"]:5.1f}  {r["RR"]:5.2f}  '
+              f'${r["total_pnl"]:>8,.2f}  {r["PF"]:5.2f}  '
+              f'{int(r["setups"]):>6d}  {int(r["wins"]):>4d}  {int(r["losses"]):>4d}')
+
+    # Save to CSV
+    out_dir = os.path.join(os.path.dirname(__file__), 'output')
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, 'optuna_directional_htf.csv')
+    results_df.to_csv(csv_path, index=False)
+    print(f'\n  Saved {len(results_df)} profitable trials -> {csv_path}')
+
+    # ── Summary ──
+    total_time = time.time() - t0
+    print(f'\n{"="*72}')
+    print(f'  SUMMARY')
+    print(f'{"="*72}')
+    print(f'  Total time: {total_time:.1f}s')
+    print(f'  Spread: ${SPREAD}/trade')
+    print(f'  RF: depth={RF_DEPTH}, trees={RF_TREES} (fixed)')
+    if opt:
+        print(f'  Best: TGT=${bp["target"]}, SL=${bp["stop"]}, '
+              f'HOR={bp["horizon"]}, TH={bp["rf_threshold"]}')
+        print(f'  Best P&L: ${opt["total_pnl"]:,.2f} | RR: {opt["rr"]} | '
+              f't: {opt["t_stat"]} | WR: {opt["wr"]}%')
+    print(f'{"="*72}')
