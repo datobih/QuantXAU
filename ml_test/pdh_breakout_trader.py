@@ -220,8 +220,10 @@ def close_position(mt5, si, pos):
     tick = mt5.symbol_info_tick(SYMBOL)
     req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": SYMBOL, "volume": pos.volume,
            "type": mt5.ORDER_TYPE_SELL, "position": pos.ticket,
-           "price": tick.bid, "deviation": 2000, "magic": MAGIC,   # $2 tolerance: the exit MUST fill
-           "type_filling": mt5.ORDER_FILLING_IOC, "comment": "PDH_time_exit"}
+           "price": tick.bid, "deviation": 2000,      # $2 tolerance: the exit MUST fill
+           "magic": pos.magic,                        # keep the STREAM's magic so the
+           "type_filling": mt5.ORDER_FILLING_IOC,     # CLOSED log row is tagged correctly
+           "comment": f"{MAGICS.get(pos.magic, 'PDH')}_time_exit"}
     return mt5.order_send(req)
 
 
