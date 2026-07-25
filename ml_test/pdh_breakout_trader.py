@@ -25,9 +25,9 @@ STRATEGY (as researched; see breakout-track memory) — TWO validated level stre
       prof/DD 9.74 vs 7.07 unstopped (pessimistic fills). Bootstrap: improvement
       positive in 94% of 2000 resampled equity paths. This is a RISK improvement,
       not a return one — the P&L difference is not significant (paired t=1.09).
-    - "tpsl": broker-side TP/SL bracket (+target/-stop). Fully self-managing
-      but NOT what was validated — tight TPs cap the trend-day winners that
-      carry this strategy's profit.
+      There is deliberately NO take-profit: the payoff is right-tailed (MFE ~2x
+      MAE) and a fixed TP caps exactly the trend-day winners that carry the
+      strategy's profit. A TP/SL bracket variant was tested and removed.
 
 SAFETY (things the repo's other traders got wrong):
   - refuses to trade a REAL account unless --allow-real is passed
@@ -42,8 +42,8 @@ DEMO account to collect honest out-of-sample trades before ever risking money.
 
 Usage (MT5 terminal running + logged in, Algo Trading enabled):
   python pdh_breakout_trader.py --dry-run            # see today's decision
-  python pdh_breakout_trader.py                      # trade on demo (VALIDATED time exit)
-  python pdh_breakout_trader.py --exit tpsl          # unvalidated bracket variant
+  python pdh_breakout_trader.py                      # trade on demo (validated spec)
+  python pdh_breakout_trader.py --protect 25         # override the disaster stop
   python pdh_breakout_trader.py --allow-real         # ONLY after demo validation
 For unattended running use run_pdh_trader.bat (auto-restart) and
 install_pdh_task.bat (start at logon).
@@ -60,8 +60,7 @@ from pathlib import Path
 SYMBOL = "XAUUSDm"
 VOLUME = 0.01
 SMA_PERIOD = 10
-TARGET_USD = 4.0          # TP distance ($/oz) for tpsl mode
-STOP_USD = 3.0            # SL distance ($/oz)
+PROTECT_USD = 12.0        # disaster-SL distance ($/oz) - see docstring for validation
 HOLD_MIN = 60            # time-exit minutes for "time" mode
 MAGIC = 770022            # daily PDH stream
 MAGIC_W = 770023          # weekly PWH stream (validated separately: +$2.55/oz, t=2.65)
@@ -182,7 +181,7 @@ def has_activity(mt5, magic: int) -> bool:
     return False
 
 
-def place_buy_stop(mt5, si, pdh, price, sl_usd, tp_usd, exit_mode, dry,
+def place_buy_stop(mt5, si, pdh, price, sl_usd, dry,
                    magic=MAGIC, comment="PDH_break_uptrend"):
     digits = si.digits
     stops_pts = si.trade_stops_level * si.point
@@ -197,7 +196,7 @@ def place_buy_stop(mt5, si, pdh, price, sl_usd, tp_usd, exit_mode, dry,
              "detail": f"entry adjusted above PDH ({pdh:.3f} -> {entry:.3f}) "
                        f"to satisfy broker min stop distance"})
     sl = round(entry - sl_usd, digits)
-    tp = round(entry + tp_usd, digits) if exit_mode == "tpsl" else 0.0
+    tp = 0.0                       # no take-profit: the exit is the 60-minute clock
     vol = max(si.volume_min, round(VOLUME / si.volume_step) * si.volume_step)
     # symbol filling_mode is a bitmask: 1=FOK, 2=IOC — RETURN is rejected on
     # market-execution symbols like Exness XAUUSDm, so pick from what's allowed
@@ -228,13 +227,7 @@ def close_position(mt5, si, pos):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exit", choices=["time", "tpsl"], default="time",
-                    help="'time' = the VALIDATED spec (60-min exit, disaster-SL only); "
-                         "'tpsl' = unvalidated bracket variant")
-    ap.add_argument("--target", type=float, default=TARGET_USD)
-    ap.add_argument("--stop", type=float, default=STOP_USD,
-                    help="SL distance for tpsl mode")
-    ap.add_argument("--protect", type=float, default=12.0,
+    ap.add_argument("--protect", type=float, default=PROTECT_USD,
                     help="time mode: disaster-SL distance ($/oz). Default 12 is walk-forward "
                          "validated (see docstring); 25 was the earlier arbitrary value.")
     ap.add_argument("--hold", type=int, default=HOLD_MIN)
@@ -249,10 +242,8 @@ def main():
 
     import MetaTrader5 as mt5
     si = connect(mt5, a.allow_real, require_trading=not a.dry_run, terminal_path=a.terminal_path)
-    if a.exit == "time":
-        print(f"exit mode: time {a.hold}min (VALIDATED spec) | disaster-SL -${a.protect} | dry_run={a.dry_run}\n")
-    else:
-        print(f"exit mode: tpsl +${a.target}/-${a.stop} (UNVALIDATED variant) | dry_run={a.dry_run}\n")
+    print(f"exit: {a.hold}min time-exit (VALIDATED spec) | disaster-SL -${a.protect} "
+          f"| vol {a.volume} | dry_run={a.dry_run}\n")
 
     import datetime as _dt
     armed_day = None
@@ -294,7 +285,7 @@ def main():
                     log({"ts_utc": nowiso, "action": "skip", "server_day": day,
                          "detail": "insufficient daily history"})
                 else:
-                    sl_dist = a.stop if a.exit == "tpsl" else a.protect
+                    sl_dist = a.protect
                     base = {"ts_utc": nowiso, "server_day": day, "pdh": round(s["pdh"], 3),
                             "sma10": round(s["sma10"], 3), "yday_close": round(s["yday_close"], 3),
                             "uptrend": s["uptrend"], "price": round(price, 3)}
@@ -312,8 +303,7 @@ def main():
                         elif has_activity(mt5, magic):
                             log({**base, "action": "skip", "detail": f"{tag}: order/position already exists"})
                         else:
-                            res, req = place_buy_stop(mt5, si, level, price, sl_dist,
-                                                      a.target, a.exit, a.dry_run,
+                            res, req = place_buy_stop(mt5, si, level, price, sl_dist, a.dry_run,
                                                       magic=magic, comment=f"{tag}_break_uptrend")
                             if a.dry_run:
                                 log({**base, "action": "DRY-would-place", "order_price": req["price"],
@@ -342,7 +332,7 @@ def main():
                          "detail": f"[{MAGICS[p.magic]}] position {p.ticket} sl={p.sl} tp={p.tp}"})
                     # re-anchor the disaster SL to the ACTUAL fill (backtest measures
                     # the stop from the fill, not the order price; matters on gap fills)
-                    if a.exit == "time" and not a.dry_run:
+                    if not a.dry_run:
                         want = round(p.price_open - a.protect, si.digits)
                         if p.sl < want - si.point:      # only ever tightens
                             r = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP,
@@ -365,7 +355,7 @@ def main():
                                    f"pnl ${dl.profit:+.2f} (reason {dl.reason})"})
 
             # --- time-exit management ---
-            if a.exit == "time" and not a.dry_run:
+            if not a.dry_run:
                 for p in (mt5.positions_get(symbol=SYMBOL) or []):
                     if p.magic not in MAGICS:
                         continue
@@ -384,7 +374,7 @@ def main():
 
     # --- supervisor: never dies except on Ctrl-C; reconnects with backoff ---
     log({"ts_utc": _now(), "action": "START", "server_day": "",
-         "detail": f"{SYMBOL} exit={a.exit} vol={a.volume} "
+         "detail": f"{SYMBOL} exit={a.hold}min sl=-${a.protect} vol={a.volume} "
                    f"{'DRY-RUN' if a.dry_run else 'LIVE'}"})
     try:
         while True:
