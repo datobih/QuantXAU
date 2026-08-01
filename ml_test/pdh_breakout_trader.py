@@ -7,11 +7,18 @@ STRATEGY (as researched; see breakout-track memory) — TWO validated level stre
     - PWH  = prior COMPLETED ISO-week's HIGH   (validated +$2.55/oz, t=2.65)
     - trend filter = prior day's CLOSE > 10-day SMA of daily closes  (uptrend)
   Entry (long only; one PDH trade per day, one PWH trade per week):
-    - only on uptrend days, and only if current price is BELOW the level
-    - a BUY-STOP pending order rests at each armed level (fills on the break);
-      the weekly order re-arms daily (day-expiry) until the week's level trades.
+    - PDH stream: gated DAILY — uptrend day and current price below the level.
+    - PWH stream: gated ONCE PER WEEK, at the week's first day (uptrend at week
+      start and week's opening price below the level) — the order then rests
+      until it fills or the ISO week ends. (Fixed 2026-08-01: the original code
+      re-gated the weekly stream every day, which changes 25% of the validated
+      trade population — 25 unvalidated trades in, 9 validated trades out.)
+    - a BUY-STOP pending order rests at each armed level (fills on the break).
       When PWH == PDH (~27% of weeks) both streams fire at the same level —
       that's 2x volume on those breaks, matching the backtest's separate streams.
+    - short-session guard: a UTC day with fewer than 62 minutes of session left
+      at arming time (the winter Sunday reopen) is skipped for the PDH stream —
+      the backtest excludes day-blocks under 62 M1 bars.
   Exit — two modes:
     - "time" (DEFAULT — the VALIDATED spec): script closes the position 60 min
       after the fill; a broker-side disaster-SL (--protect, default $12) is the
@@ -37,14 +44,23 @@ day — and the strategy's profit bursts fire 00:00-01:00 UTC, right after the
 UTC roll. Backtested on FTMO's own feed 2021-2026: UTC-day levels earn
 +$1.42/trade (t=3.89) vs +$1.14 (t=3.00) with server-day levels.
 Default --day-boundary utc therefore:
-  - measures the server-UTC offset from live ticks (rounded to the hour,
-    only trusted while ticks are flowing; re-checked every poll => DST-proof)
+  - measures the server-UTC offset from live ticks (rounded to the hour).
+    HARDENED 2026-08-01 after an adversarial audit: the FIRST tick seen by a
+    fresh process only PRIMES the freshness gate and is never measured — a
+    stale cached tick whose age is near a whole hour would otherwise latch a
+    wrong offset (~1 in 6 restart timings; reproduced end-to-end). A
+    measurement now requires a tick that ARRIVED while we were watching.
+    Re-checked every poll => the broker's DST switch self-corrects.
+  - the measured offset is part of the arming key: if the offset ever changes
+    (DST switch, or a corrected mis-measurement), our pending orders are
+    cancelled and the day re-armed at the corrected levels.
+  - offsets outside {0, +2/+3-per-US-DST} are accepted but logged loudly —
+    they usually mean the PC clock is wrong by a whole hour.
   - builds PDH / SMA10 / PWH from H1 bars bucketed into UTC calendar days
     (identical aggregation to the validated backtest)
   - keys one-trade-per-day / per-week to UTC dates
-  - pending orders expire at UTC midnight via ORDER_TIME_SPECIFIED (broker
-    day-expiry would cancel them before the burst window on GMT+2/+3 servers);
-    falls back to GTC + cancel-on-day-roll if the broker lacks SPECIFIED.
+  - PDH orders expire at UTC midnight, PWH orders at the ISO-week end, via
+    ORDER_TIME_SPECIFIED; falls back to GTC + cancel-on-roll if unsupported.
 On a UTC broker the offset measures 0 and behavior matches the original spec.
 --day-boundary server restores the old terminal-D1 behavior for A/B.
 
@@ -193,14 +209,24 @@ def daily_setup(mt5):
     cur_week = iso(rates[-1]["time"])
     prev_weeks = [iso(r["time"]) for r in completed if iso(r["time"]) != cur_week]
     pwh = week_high = None
+    pwh_gate = False
     if prev_weeks:
         last_prev = max(prev_weeks)
         pwh = max(float(r["high"]) for r in completed if iso(r["time"]) == last_prev)
-        wk_highs = [float(r["high"]) for r in rates if iso(r["time"]) == cur_week]
-        week_high = max(wk_highs) if wk_highs else today_high
+        wk_rates = [r for r in rates if iso(r["time"]) == cur_week]
+        week_high = max(float(r["high"]) for r in wk_rates) if wk_rates else today_high
+        # weekly gate: evaluated ONCE at the week's first day (the validated
+        # spec) — uptrend as of the week's open, and the week OPENED below the
+        # level. Re-gating daily changes 25% of the trade population.
+        if wk_rates:
+            first = wk_rates[0]
+            pre = [float(r["close"]) for r in completed if r["time"] < first["time"]]
+            if len(pre) >= SMA_PERIOD + 1:
+                sma_wk = sum(pre[-SMA_PERIOD:]) / SMA_PERIOD
+                pwh_gate = pre[-1] > sma_wk and float(first["open"]) < pwh
     return {"pdh": pdh, "uptrend": yday_close > sma10, "sma10": sma10,
             "yday_close": yday_close, "today_high": today_high,
-            "pwh": pwh, "week_high": week_high}
+            "pwh": pwh, "week_high": week_high, "pwh_gate": pwh_gate}
 
 
 def _us_dst(ts_utc: float) -> bool:
@@ -234,14 +260,18 @@ def daily_setup_utc(mt5, offset_sec: int):
         now_srv = int(rates[-1]["time"])
         winter = offset_sec - (3600 if _us_dst(now_srv - offset_sec) else 0)
         bar_off = lambda ts: winter + (3600 if _us_dst(ts - winter) else 0)
-    days: dict = {}                                 # date -> [high, close, last_ts]
+    days: dict = {}                    # date -> [high, close, last_ts, first_open, first_ts]
     for r in rates:
-        ts = int(r["time"]) - bar_off(int(r["time"]))
+        rts = int(r["time"])
+        ts = rts - bar_off(rts)
         d = datetime.fromtimestamp(ts, timezone.utc).date()
-        rec = days.setdefault(d, [float(r["high"]), float(r["close"]), ts])
+        rec = days.setdefault(d, [float(r["high"]), float(r["close"]), ts,
+                                  float(r["open"]), ts])
         rec[0] = max(rec[0], float(r["high"]))
         if ts >= rec[2]:
             rec[1], rec[2] = float(r["close"]), ts
+        if ts < rec[4]:
+            rec[3], rec[4] = float(r["open"]), ts
     dl = sorted(days)
     today, completed = dl[-1], dl[:-1]
     if len(completed) < SMA_PERIOD + 1:
@@ -255,29 +285,48 @@ def daily_setup_utc(mt5, offset_sec: int):
     prev_weeks = sorted({d.isocalendar()[:2] for d in completed
                          if d.isocalendar()[:2] != cur_week})
     pwh = week_high = None
+    pwh_gate = False
     if prev_weeks:
         last_prev = prev_weeks[-1]
         pwh = max(days[d][0] for d in completed if d.isocalendar()[:2] == last_prev)
-        wk = [days[d][0] for d in dl if d.isocalendar()[:2] == cur_week]
-        week_high = max(wk) if wk else today_high
+        week_days = [d for d in dl if d.isocalendar()[:2] == cur_week]
+        week_high = max(days[d][0] for d in week_days) if week_days else today_high
+        # weekly gate: fixed at the week's FIRST day (validated spec — see
+        # daily_setup): uptrend as of the week open + week opened below level
+        if week_days:
+            wf = week_days[0]
+            pre = [days[d][1] for d in completed if d < wf]
+            if len(pre) >= SMA_PERIOD + 1:
+                sma_wk = sum(pre[-SMA_PERIOD:]) / SMA_PERIOD
+                pwh_gate = pre[-1] > sma_wk and days[wf][3] < pwh
     return {"pdh": pdh, "uptrend": yday_close > sma10, "sma10": sma10,
             "yday_close": yday_close, "today_high": today_high,
-            "pwh": pwh, "week_high": week_high}
+            "pwh": pwh, "week_high": week_high, "pwh_gate": pwh_gate}
 
 
-def cancel_stale_orders(mt5, offset_sec: int, cur_day: str) -> None:
-    """UTC mode: remove our pending orders left over from a previous UTC day
-    (covers the GTC-expiry fallback and restarts; harmless when SPECIFIED
-    expiry already culled them)."""
+def cancel_stale_orders(mt5, offset_sec: int, cur_day: str, cur_week, force=False) -> None:
+    """UTC mode: remove our pending orders that outlived their window — a PDH
+    order from a previous UTC day, or a PWH order from a previous ISO week
+    (the weekly order deliberately RESTS across day rolls). force=True removes
+    all our pendings regardless of age — used when the measured offset changes,
+    because orders placed under the old offset sit at suspect levels.
+    Covers the GTC-expiry fallback and restarts; harmless when SPECIFIED
+    expiry already culled them. A failed REMOVE is logged loudly."""
     for o in (mt5.orders_get(symbol=SYMBOL) or []):
-        if o.magic in MAGICS:
-            od = datetime.fromtimestamp(int(o.time_setup) - offset_sec,
-                                        timezone.utc).strftime("%Y-%m-%d")
-            if od != cur_day:
-                r = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
-                log({"ts_utc": _now(), "action": "CANCEL-STALE", "server_day": cur_day,
-                     "detail": f"[{MAGICS[o.magic]}] removed order {o.ticket} from {od} "
-                               f"(retcode {getattr(r, 'retcode', '?')})"})
+        if o.magic not in MAGICS:
+            continue
+        od = datetime.fromtimestamp(int(o.time_setup) - offset_sec, timezone.utc)
+        stale = force or (o.magic == MAGIC and od.strftime("%Y-%m-%d") != cur_day) \
+                      or (o.magic == MAGIC_W and od.isocalendar()[:2] != cur_week)
+        if stale:
+            r = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+            rc = getattr(r, "retcode", None)
+            ok = rc == mt5.TRADE_RETCODE_DONE
+            log({"ts_utc": _now(), "action": "CANCEL-STALE" if ok else "CANCEL-FAIL",
+                 "server_day": cur_day,
+                 "detail": f"[{MAGICS[o.magic]}] {'removed' if ok else 'FAILED to remove'} "
+                           f"order {o.ticket} from {od.date()} (retcode {rc})"
+                           + ("" if ok else " — will retry next poll")})
 
 
 def has_activity(mt5, magic: int) -> bool:
@@ -373,8 +422,13 @@ def main():
 
     import datetime as _dt
     armed_day = None
+    armed_off = None                                # offset the day was armed under
     offset_sec = 0 if a.day_boundary == "server" else None   # server_clock - UTC
     last_tick_time = 0
+    none_ticks = 0                                  # consecutive polls with no tick
+    once_polls = 0                                  # --once: polls spent waiting for offset
+    arm_tries = 0                                   # bounded retry of a failed arming
+    skip_key = None                                 # throttles the setup-failure log
     fill_time: dict = {}                            # position ticket -> fill epoch (time exit)
     known_pos: set = set()                          # tickets already logged as FILLED
     closed_logged: set = set()                      # position ids already logged as CLOSED
@@ -385,40 +439,60 @@ def main():
     def run():
         """The trading loop. Raises on a dead connection so the supervisor can
         reconnect; state (armed_day etc.) is preserved across restarts."""
-        nonlocal armed_day, offset_sec, last_tick_time, last_beat, errors
+        nonlocal armed_day, armed_off, offset_sec, last_tick_time, none_ticks, \
+                 once_polls, arm_tries, skip_key, last_beat, errors, hist_from
         while True:
             term = mt5.terminal_info()
             if term is None or not term.connected:
                 raise ConnectionError("terminal not connected")
             tick = mt5.symbol_info_tick(SYMBOL)
             if tick is None or tick.time == 0:
+                # a dead symbol feed with a "connected" terminal would spin
+                # silently forever — escalate so the supervisor reconnects
+                none_ticks += 1
+                if none_ticks * POLL_SEC >= 1800:
+                    none_ticks = 0
+                    raise ConnectionError("no tick data for 30min (symbol feed dead?)")
                 time.sleep(POLL_SEC); continue
+            none_ticks = 0
 
             # --- server-UTC offset (utc mode): trust only FLOWING ticks ---
-            # A stale weekend tick would give a garbage offset; a fresh tick is
-            # within seconds of the machine clock, so rounding to the hour is
-            # exact. Re-measured every poll => the broker's DST switch (over a
-            # closed weekend) is picked up at the Sunday reopen automatically.
-            if a.day_boundary == "utc" and tick.time != last_tick_time:
+            # A fresh tick is within seconds of the machine clock, so rounding
+            # to the hour is exact. The FIRST tick a process sees only PRIMES
+            # the gate and is never measured: a terminal's cached pre-sync tick
+            # whose age is near a whole hour would otherwise latch a wrong
+            # offset (~1 in 6 restart timings; reproduced end-to-end in the
+            # 2026-08-01 audit). Re-measured every poll => the broker's DST
+            # switch (over a closed weekend) self-corrects at the reopen.
+            flowing = last_tick_time != 0 and tick.time != last_tick_time
+            if a.day_boundary == "utc" and flowing:
                 cand = tick.time - time.time()
                 hrs = round(cand / 3600.0)
                 if -12 <= hrs <= 14 and abs(cand - hrs * 3600) <= 300:
                     if offset_sec != hrs * 3600:
+                        expect = 3 if _us_dst(time.time()) else 2
+                        warn = "" if hrs in (0, expect) else \
+                            f" — UNUSUAL (expected 0 or +{expect}); check the PC clock!"
                         log({"ts_utc": _now(), "action": "note",
-                             "detail": f"server-UTC offset measured: {hrs:+d}h"})
+                             "detail": f"server-UTC offset measured: {hrs:+d}h{warn}"})
                         offset_sec = hrs * 3600
             last_tick_time = tick.time
-            if offset_sec is None:                  # market closed since launch
+            if offset_sec is None:                  # not yet measured
                 if a.once:
+                    # first tick only primes, so give a live market a few polls
+                    # to deliver a measurable second tick before giving up
+                    if once_polls < 4:
+                        once_polls += 1
+                        time.sleep(POLL_SEC); continue
                     log({"ts_utc": _now(), "action": "skip",
-                         "detail": "no live ticks — cannot measure server-UTC offset "
-                                   "(market closed?); nothing to arm"})
+                         "detail": "no fresh ticks — cannot measure server-UTC "
+                                   "offset (market closed?); nothing to arm"})
                     return
-                if last_beat == 0.0:                # say it once, not every 20s
+                if tick.time - last_beat >= 21600 or last_beat == 0.0:
                     last_beat = tick.time
-                    log({"ts_utc": _now(), "action": "note",
-                         "detail": "waiting for live ticks to measure server-UTC "
-                                   "offset (market closed?) — will arm at reopen"})
+                    log({"ts_utc": _now(), "action": "ALIVE",
+                         "detail": "waiting to measure server-UTC offset "
+                                   f"(ticks {'FLOWING — if this persists, the PC clock is off by minutes; fix it' if flowing else 'stalled — market closed?'})"})
                 time.sleep(POLL_SEC); continue
 
             now = datetime.fromtimestamp(tick.time - offset_sec, timezone.utc)  # UTC clock
@@ -435,46 +509,77 @@ def main():
                                f"offset={offset_sec // 3600:+d}h)"})
 
             # --- once per new trading day: evaluate setup & place order ---
-            # (armed_day is set only AFTER evaluation completes, so a disconnect
-            #  mid-evaluation retries after reconnect instead of skipping the day)
-            if day != armed_day:
-                if a.day_boundary == "utc":
-                    if not a.dry_run:
-                        cancel_stale_orders(mt5, offset_sec, day)
-                    s = daily_setup_utc(mt5, offset_sec)
-                else:
-                    s = daily_setup(mt5)
+            # The arming key is (day, offset): a corrected offset re-arms the
+            # day at the corrected levels (audit 2026-08-01). armed_day is set
+            # only AFTER a successful evaluation — a transient failure (H1
+            # history not yet synced, order rejected) retries next poll,
+            # bounded by arm_tries so a permanent failure cannot spam forever.
+            if day != armed_day or (a.day_boundary == "utc" and offset_sec != armed_off):
+                if (day, offset_sec) != skip_key:
+                    arm_tries = 0                   # new day (or new offset): fresh retries
+                if a.day_boundary == "utc" and not a.dry_run:
+                    # offset changed => orders placed under the old offset rest
+                    # at suspect levels (incl. a same-ISO-week PWH order that
+                    # date-based cleanup would keep): remove them all, once
+                    force = armed_off is not None and offset_sec != armed_off \
+                            and arm_tries == 0
+                    if force:
+                        log({"ts_utc": nowiso, "action": "note", "server_day": day,
+                             "detail": f"offset changed {armed_off//3600 if armed_off is not None else '?'}h -> "
+                                       f"{offset_sec//3600}h — cancelling orders, re-arming"})
+                    cancel_stale_orders(mt5, offset_sec, day, now.isocalendar()[:2],
+                                        force=force)
+                s = daily_setup_utc(mt5, offset_sec) if a.day_boundary == "utc" \
+                    else daily_setup(mt5)
                 if s is None:
-                    log({"ts_utc": nowiso, "action": "skip", "server_day": day,
-                         "detail": "insufficient daily history"})
+                    if (day, offset_sec) != skip_key:      # log once, retry silently
+                        skip_key = (day, offset_sec)
+                        log({"ts_utc": nowiso, "action": "skip", "server_day": day,
+                             "detail": "insufficient daily history — will retry "
+                                       "every poll until it loads"})
                 else:
+                    skip_key = (day, offset_sec)
                     sl_dist = a.protect
-                    # utc mode: order lives until UTC midnight (converted to the
-                    # server clock); server mode: broker day-expiry as before
-                    expiry = None
+                    # PDH order lives until UTC midnight; PWH until the ISO week
+                    # ends (it rests across day rolls — the weekly gate was
+                    # already fixed at the week's first day). server mode keeps
+                    # broker day-expiry.
+                    eff = tick.time - offset_sec
+                    next_mid = (eff // 86400 + 1) * 86400
+                    expiry_d = expiry_w = None
                     if a.day_boundary == "utc":
-                        next_mid = ((tick.time - offset_sec) // 86400 + 1) * 86400
-                        expiry = int(next_mid + offset_sec)
+                        expiry_d = int(next_mid + offset_sec)
+                        expiry_w = int((eff // 86400 + (7 - now.weekday())) * 86400
+                                       + offset_sec)
                     base = {"ts_utc": nowiso, "server_day": day, "pdh": round(s["pdh"], 3),
                             "sma10": round(s["sma10"], 3), "yday_close": round(s["yday_close"], 3),
                             "uptrend": s["uptrend"], "price": round(price, 3)}
 
-                    def arm(level, magic, tag, high_guard, guard_name):
-                        if not s["uptrend"]:
-                            log({**base, "action": "no-trade", "detail": f"{tag}: not an uptrend day"})
+                    def arm(level, magic, tag, high_guard, guard_name,
+                            gate_ok, gate_msg, expiry_ts):
+                        """Returns False only on a retryable order failure.
+                        quiet on retries: the no-trade/skip rows were already
+                        logged on the first attempt."""
+                        quiet = arm_tries > 0
+                        if not gate_ok:
+                            if not quiet:
+                                log({**base, "action": "no-trade", "detail": f"{tag}: {gate_msg}"})
                         elif price >= level:
-                            log({**base, "action": "no-trade",
-                                 "detail": f"{tag}: price already >= level {level:.3f}"})
+                            if not quiet:
+                                log({**base, "action": "no-trade",
+                                     "detail": f"{tag}: price already >= level {level:.3f}"})
                         elif high_guard is not None and high_guard >= level:
-                            log({**base, "action": "no-trade",
-                                 "detail": f"{tag}: level {level:.3f} already touched "
-                                           f"({guard_name} high {high_guard:.3f})"})
+                            if not quiet:
+                                log({**base, "action": "no-trade",
+                                     "detail": f"{tag}: level {level:.3f} already touched "
+                                               f"({guard_name} high {high_guard:.3f})"})
                         elif has_activity(mt5, magic):
-                            log({**base, "action": "skip", "detail": f"{tag}: order/position already exists"})
+                            if not quiet:
+                                log({**base, "action": "skip", "detail": f"{tag}: order/position already exists"})
                         else:
                             res, req = place_buy_stop(mt5, si, level, price, sl_dist, a.dry_run,
                                                       magic=magic, comment=f"{tag}_break_uptrend",
-                                                      expiry=expiry)
+                                                      expiry=expiry_ts)
                             if a.dry_run:
                                 log({**base, "action": "DRY-would-place", "order_price": req["price"],
                                      "sl": req["sl"], "tp": req["tp"], "volume": req["volume"],
@@ -486,12 +591,37 @@ def main():
                             else:
                                 log({**base, "action": "ORDER-FAIL", "order_price": req["price"],
                                      "detail": f"{tag}: retcode {getattr(res,'retcode','?')} "
-                                               f"{getattr(res,'comment','')}"})
+                                               f"{getattr(res,'comment','')} (try {arm_tries + 1})"})
+                                return False
+                        return True
 
-                    arm(s["pdh"], MAGIC, "PDH", s["today_high"], "today")
+                    ok = True
+                    # short-session guard: the backtest excludes day-blocks with
+                    # under 62 M1 bars — live equivalent: skip the PDH stream
+                    # when under 62 minutes of UTC day remain at arming time
+                    # (the winter Sunday reopen). Weekly stream is unaffected.
+                    if a.day_boundary == "utc" and next_mid - eff < 62 * 60:
+                        if arm_tries == 0:
+                            log({**base, "action": "no-trade",
+                                 "detail": f"PDH: only {(next_mid - eff) // 60}min of UTC day "
+                                           "left (short session) — backtest excludes these"})
+                    else:
+                        ok &= arm(s["pdh"], MAGIC, "PDH", s["today_high"], "today",
+                                  s["uptrend"], "not an uptrend day", expiry_d)
                     if s["pwh"] is not None:
-                        arm(s["pwh"], MAGIC_W, "PWH", s["week_high"], "week")
-                armed_day = day
+                        ok &= arm(s["pwh"], MAGIC_W, "PWH", s["week_high"], "week",
+                                  s.get("pwh_gate", False),
+                                  "week-start gate failed (not uptrend at week open, "
+                                  "or week opened above level)", expiry_w)
+                    if ok or arm_tries >= 15:
+                        if not ok:
+                            log({"ts_utc": nowiso, "action": "ERROR", "server_day": day,
+                                 "detail": "giving up on today's failed order after "
+                                           f"{arm_tries + 1} tries"})
+                        armed_day, armed_off = day, offset_sec
+                        arm_tries = 0
+                    else:
+                        arm_tries += 1              # retry next poll
 
             # --- fill detection: log the moment a buy-stop becomes a position ---
             for p in (mt5.positions_get(symbol=SYMBOL) or []):
@@ -514,7 +644,12 @@ def main():
                                            f"{a.protect} (retcode {getattr(r,'retcode','?')})"})
 
             # --- close detection: log final P&L of finished trades (SL/TP/time) ---
-            deals = mt5.history_deals_get(hist_from, datetime.now(timezone.utc)) or []
+            # sliding 2-day window (a frozen start would re-scan months of
+            # history every poll); upper bound padded because deal stamps are
+            # SERVER time, which runs ahead of UTC on GMT+2/+3 brokers
+            hist_from = max(hist_from, _dt.datetime.now(timezone.utc) - _dt.timedelta(days=2))
+            deals = mt5.history_deals_get(
+                hist_from, datetime.now(timezone.utc) + _dt.timedelta(hours=13)) or []
             for dl in deals:
                 if dl.magic in MAGICS and dl.entry == mt5.DEAL_ENTRY_OUT \
                         and dl.position_id not in closed_logged:
