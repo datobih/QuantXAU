@@ -11,6 +11,11 @@ REM ============================================================================
 cd /d "%~dp0"
 set "TERMINAL=C:\Program Files\MetaTrader 5\terminal64.exe"
 set "CONSOLE=..\data\processed\pdh_trader_console.log"
+REM Standing arguments used on EVERY launch, including Task Scheduler starts
+REM (which pass no command-line args). Example for the prop plan:
+REM   set "EXTRA_ARGS=--volume 1.25"
+REM Left empty = the script's demo-safe defaults (0.01 lots).
+set "EXTRA_ARGS="
 
 echo ============================================================
 echo  PDH breakout trader is RUNNING in this window.
@@ -24,7 +29,7 @@ echo.
 :loop
 echo [%date% %time%] launching pdh_breakout_trader  (window stays quiet; see logs)
 echo [%date% %time%] launching pdh_breakout_trader >> "%CONSOLE%"
-python -u pdh_breakout_trader.py --terminal-path "%TERMINAL%" %* >> "%CONSOLE%" 2>&1
+python -u pdh_breakout_trader.py --terminal-path "%TERMINAL%" %EXTRA_ARGS% %* >> "%CONSOLE%" 2>&1
 echo [%date% %time%] trader exited (code %errorlevel%) - restarting in 30s
 echo [%date% %time%] trader exited (code %errorlevel%) - restarting in 30s >> "%CONSOLE%"
 ping -n 31 127.0.0.1 >nul
