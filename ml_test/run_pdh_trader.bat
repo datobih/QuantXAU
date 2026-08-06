@@ -11,6 +11,9 @@ REM ============================================================================
 cd /d "%~dp0"
 set "TERMINAL=C:\Program Files\MetaTrader 5\terminal64.exe"
 set "CONSOLE=..\data\processed\pdh_trader_console.log"
+REM data\ is gitignored, so a fresh clone lacks the log folder — create it
+REM (cmd does not create directories for >> redirects)
+if not exist "..\data\processed" mkdir "..\data\processed"
 REM Standing arguments used on EVERY launch, including Task Scheduler starts
 REM (which pass no command-line args). Example for the prop plan:
 REM   set "EXTRA_ARGS=--volume 1.25"
