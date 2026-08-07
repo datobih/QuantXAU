@@ -188,14 +188,24 @@ def connect(mt5, allow_real: bool, require_trading: bool = True, terminal_path=N
     return si
 
 
-def daily_setup(mt5):
+def daily_setup(mt5, expect_day=None):
     """Daily + weekly levels from D1 bars. Returns dict or None.
+    expect_day: the trading day (date) the caller is arming. If the feed's
+    forming bar predates it, the terminal hasn't printed the new day yet —
+    return None so the caller retries instead of evaluating YESTERDAY's
+    levels as today's (2026-08-07 VPS incident: a poll 7s after midnight
+    saw a stale feed, judged the old level "already touched", and silently
+    burned the whole day).
     pwh = prior COMPLETED ISO-week's high; week_high = this week's high so far
     (completed days this week + the forming day) — the restart-proof
     one-trade-per-week guard."""
     rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_D1, 0, max(SMA_PERIOD + 3, 25))
     if rates is None or len(rates) < SMA_PERIOD + 2:
         return None
+    if expect_day is not None:
+        forming = datetime.fromtimestamp(int(rates[-1]["time"]), timezone.utc).date()
+        if forming != expect_day:
+            return None                         # new day's bar not printed yet — retry
     completed = rates[:-1]                      # drop the current forming day
     closes = [r["close"] for r in completed]
     pdh = float(completed[-1]["high"])          # yesterday's high
@@ -240,10 +250,12 @@ def _us_dst(ts_utc: float) -> bool:
     return nth_sunday(3, 2).replace(hour=7) <= d < nth_sunday(11, 1).replace(hour=6)
 
 
-def daily_setup_utc(mt5, offset_sec: int):
+def daily_setup_utc(mt5, offset_sec: int, expect_day=None):
     """Same levels as daily_setup, but from H1 bars bucketed into UTC calendar
     days (the validated backtest's aggregation) instead of the terminal's D1
     server days. offset_sec = server_clock - UTC, measured from live ticks.
+    expect_day: see daily_setup — None is returned when the feed's latest
+    UTC day predates the day being armed (midnight-roll race guard).
     Every UTC date with any bars counts as a day (incl. the short Sunday
     session) — exactly like the backtest's daily resample.
 
@@ -273,6 +285,8 @@ def daily_setup_utc(mt5, offset_sec: int):
         if ts < rec[4]:
             rec[3], rec[4] = float(r["open"]), ts
     dl = sorted(days)
+    if expect_day is not None and dl[-1] != expect_day:
+        return None                             # new day's bar not printed yet — retry
     today, completed = dl[-1], dl[:-1]
     if len(completed) < SMA_PERIOD + 1:
         return None
@@ -529,14 +543,15 @@ def main():
                                        f"{offset_sec//3600}h — cancelling orders, re-arming"})
                     cancel_stale_orders(mt5, offset_sec, day, now.isocalendar()[:2],
                                         force=force)
-                s = daily_setup_utc(mt5, offset_sec) if a.day_boundary == "utc" \
-                    else daily_setup(mt5)
+                s = daily_setup_utc(mt5, offset_sec, expect_day=now.date()) \
+                    if a.day_boundary == "utc" else daily_setup(mt5, expect_day=now.date())
                 if s is None:
                     if (day, offset_sec) != skip_key:      # log once, retry silently
                         skip_key = (day, offset_sec)
                         log({"ts_utc": nowiso, "action": "skip", "server_day": day,
-                             "detail": "insufficient daily history — will retry "
-                                       "every poll until it loads"})
+                             "detail": "setup not ready (history missing, or the new "
+                                       "day's first bar not printed yet) — retrying "
+                                       "every poll"})
                 else:
                     skip_key = (day, offset_sec)
                     sl_dist = a.protect
