@@ -645,18 +645,29 @@ def main():
                     log({"ts_utc": nowiso, "action": "FILLED", "server_day": day,
                          "price": p.price_open, "volume": p.volume,
                          "detail": f"[{MAGICS[p.magic]}] position {p.ticket} sl={p.sl} tp={p.tp}"})
-                    # re-anchor the disaster SL to the ACTUAL fill (backtest measures
-                    # the stop from the fill, not the order price; matters on gap fills)
-                    if not a.dry_run:
+                    # The pending order's SL (order_price - protect) IS the validated
+                    # spec: the backtest's entry is the level, so its stop is
+                    # level - protect. Re-anchoring to fill-protect (removed
+                    # 2026-08-22) silently TIGHTENED the stop by the entry slippage
+                    # on fast-burst fills (FTMO real fills slipped $0.1-$6.4; the
+                    # 2026-08-19 weekly trade was stopped by the re-anchored SL in
+                    # a flush the spec stop survives: -$147 live vs +$279 on spec —
+                    # a $426 swing). Only attach an SL if the position somehow has
+                    # none; log big slips for the live-vs-backtest ledger.
+                    if not a.dry_run and p.sl == 0.0:
                         want = round(p.price_open - a.protect, si.digits)
-                        if p.sl < want - si.point:      # only ever tightens
-                            r = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP,
-                                                "symbol": SYMBOL, "position": p.ticket,
-                                                "sl": want, "tp": p.tp})
-                            log({"ts_utc": nowiso, "action": "SL-ADJUST", "server_day": day,
-                                 "sl": want,
-                                 "detail": f"[{MAGICS[p.magic]}] re-anchored SL to fill-"
-                                           f"{a.protect} (retcode {getattr(r,'retcode','?')})"})
+                        r = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP,
+                                            "symbol": SYMBOL, "position": p.ticket,
+                                            "sl": want, "tp": p.tp})
+                        log({"ts_utc": nowiso, "action": "SL-ADJUST", "server_day": day,
+                             "sl": want,
+                             "detail": f"[{MAGICS[p.magic]}] position had NO SL — set to "
+                                       f"fill-{a.protect} (retcode {getattr(r,'retcode','?')})"})
+                    slip = p.price_open - (p.sl + a.protect) if p.sl > 0 else 0.0
+                    if slip > 1.0:
+                        log({"ts_utc": nowiso, "action": "note", "server_day": day,
+                             "detail": f"[{MAGICS[p.magic]}] entry slipped ${slip:.2f} above "
+                                       f"the level; SL stays at level-{a.protect} (spec)"})
 
             # --- close detection: log final P&L of finished trades (SL/TP/time) ---
             # sliding 2-day window (a frozen start would re-scan months of
