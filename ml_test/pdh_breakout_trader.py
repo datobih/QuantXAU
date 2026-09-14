@@ -19,10 +19,27 @@ STRATEGY (as researched; see breakout-track memory) — TWO validated level stre
     - short-session guard: a UTC day with fewer than 62 minutes of session left
       at arming time (the winter Sunday reopen) is skipped for the PDH stream —
       the backtest excludes day-blocks under 62 M1 bars.
-  Exit — two modes:
-    - "time" (DEFAULT — the VALIDATED spec): script closes the position 60 min
-      after the fill; a broker-side disaster-SL (--protect, default $12) is the
-      only other exit. Needs the script running for the time exit.
+  Exit — conditional time exit (DEFAULT since 2026-09-14) + disaster-SL:
+    - at --hold minutes after the fill (default 60): if the bid is AT OR BELOW
+      the fill price the position is closed (the trade is red — exactly the old
+      60-minute exit for those trades); if it is above the fill price the
+      position is held to --hold-green minutes (default 90) and closed then.
+      Validated on the live-consistent trade set (FTMO + Exness feeds, real
+      fills, 2021-2026): +$0.43-0.45/oz per trade over the flat 60-minute exit
+      (paired t 2.3-2.4, weekly-block bootstrap CI excludes 0), same max
+      drawdown, profit/DD 4.5 -> 5.7 (FTMO) / 8.7 -> 11.8 (Exness). Mechanism:
+      trades green at 60 gain ~+$0.9 more by 90, trades red at 60 gain nothing.
+      Check-time sweep 15-80 min is a flat plateau from 40 to 80 (60 sits on
+      it; 45 is a noise spike); hold 90 beats 105/120 everywhere. CAVEAT: the
+      gain is concentrated in 2024-26 (2021-23 ~0) — regime-conditional.
+      The check happens ONCE, at the first poll >= --hold; a trade that is
+      green then stays open to --hold-green even if it turns red later.
+      Win rate is a few points lower under this rule (marginal greens that
+      fade become small losers) while average winners grow.
+    - --flat-hold restores the old rule: close every position at --hold
+      minutes regardless of P&L (the 60-minute spec validated 2026-07).
+    - the broker-side disaster-SL (--protect, default $12 below the level)
+      is the only other exit. Needs the script running for the time exits.
       WHY $12 (changed from an arbitrary $25 on 2026-07-24): tested bar-accurately
       across stop levels and three fill models. At $12 it triggers on 29/470
       backtest trades (6.2%), kills only 2 winners in 5 years, and lifts
@@ -99,7 +116,8 @@ SYMBOL_CANDIDATES = ("XAUUSDm", "XAUUSD")   # Exness, FTMO/most brokers
 VOLUME = 0.01
 SMA_PERIOD = 10
 PROTECT_USD = 12.0        # disaster-SL distance ($/oz) - see docstring for validation
-HOLD_MIN = 60            # time-exit minutes for "time" mode
+HOLD_MIN = 60            # minute of the red check (and the flat exit under --flat-hold)
+HOLD_GREEN_MIN = 90      # trades above their fill price at HOLD_MIN are held to here
 MAGIC = 770022            # daily PDH stream
 MAGIC_W = 770023          # weekly PWH stream (validated separately: +$2.55/oz, t=2.65)
 MAGICS = {MAGIC: "daily", MAGIC_W: "weekly"}
@@ -397,6 +415,27 @@ def place_buy_stop(mt5, si, pdh, price, sl_usd, dry,
     return res, req
 
 
+def exit_decision(elapsed_sec: float, bid: float, price_open: float,
+                  hold_min: int, hold_green_min: int, flat: bool, extended: bool):
+    """The exit rule, kept pure so it can be unit-tested without a terminal.
+    Returns ("close", reason), ("extend", None) or (None, None).
+      flat=True : close at hold_min regardless of P&L (old 60-minute spec)
+      default   : at hold_min, close if bid <= fill price (red), else extend
+                  once to hold_green_min and close there. `extended` says the
+                  green decision was already taken for this position."""
+    if not flat and extended:
+        if elapsed_sec >= hold_green_min * 60:
+            return "close", f"{hold_green_min}min (was green at {hold_min}min)"
+        return None, None
+    if elapsed_sec < hold_min * 60:
+        return None, None
+    if flat:
+        return "close", f"{hold_min}min"
+    if bid <= price_open:
+        return "close", f"red at {hold_min}min (bid {bid:.3f} <= fill {price_open:.3f})"
+    return "extend", None
+
+
 def close_position(mt5, si, pos):
     tick = mt5.symbol_info_tick(SYMBOL)
     req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": SYMBOL, "volume": pos.volume,
@@ -413,7 +452,14 @@ def main():
     ap.add_argument("--protect", type=float, default=PROTECT_USD,
                     help="time mode: disaster-SL distance ($/oz). Default 12 is walk-forward "
                          "validated (see docstring); 25 was the earlier arbitrary value.")
-    ap.add_argument("--hold", type=int, default=HOLD_MIN)
+    ap.add_argument("--hold", type=int, default=HOLD_MIN,
+                    help="minute of the red check: a position at/below its fill price is "
+                         "closed here (default 60). With --flat-hold: every position is closed here.")
+    ap.add_argument("--hold-green", type=int, default=HOLD_GREEN_MIN,
+                    help="positions above their fill price at --hold are held to this minute "
+                         "and closed (default 90). Ignored with --flat-hold.")
+    ap.add_argument("--flat-hold", action="store_true",
+                    help="old spec: close every position at --hold minutes regardless of P&L")
     ap.add_argument("--volume", type=float, default=VOLUME)
     ap.add_argument("--symbol", default="auto",
                     help="broker symbol name; 'auto' tries XAUUSDm then XAUUSD")
@@ -431,7 +477,13 @@ def main():
     import MetaTrader5 as mt5
     si = connect(mt5, a.allow_real, require_trading=not a.dry_run,
                  terminal_path=a.terminal_path, symbol_arg=a.symbol)
-    print(f"exit: {a.hold}min time-exit (VALIDATED spec) | disaster-SL -${a.protect} "
+    if a.flat_hold:
+        exit_desc = f"{a.hold}min flat time-exit (old spec, --flat-hold)"
+    else:
+        if a.hold_green <= a.hold:
+            raise SystemExit(f"--hold-green ({a.hold_green}) must be greater than --hold ({a.hold})")
+        exit_desc = f"red at {a.hold}min -> close, else hold to {a.hold_green}min (validated 2026-09)"
+    print(f"exit: {exit_desc} | disaster-SL -${a.protect} "
           f"| vol {a.volume} | day-boundary {a.day_boundary} | dry_run={a.dry_run}\n")
 
     import datetime as _dt
@@ -444,6 +496,7 @@ def main():
     arm_tries = 0                                   # bounded retry of a failed arming
     skip_key = None                                 # throttles the setup-failure log
     fill_time: dict = {}                            # position ticket -> fill epoch (time exit)
+    extended: set = set()                           # tickets judged green at --hold (held to --hold-green)
     known_pos: set = set()                          # tickets already logged as FILLED
     closed_logged: set = set()                      # position ids already logged as CLOSED
     hist_from = _dt.datetime.now(timezone.utc) - _dt.timedelta(days=1)
@@ -685,18 +738,32 @@ def main():
                          "detail": f"[{MAGICS[dl.magic]}] position {dl.position_id} "
                                    f"pnl ${dl.profit:+.2f} (reason {dl.reason})"})
 
-            # --- time-exit management ---
+            # --- time-exit management (see exit_decision) ---
+            # Restart note: `extended` is process memory. After a restart a
+            # position already past --hold is re-judged on the current bid —
+            # the only way the live rule can differ from the backtest, and only
+            # on restarts.
             if not a.dry_run:
                 for p in (mt5.positions_get(symbol=SYMBOL) or []):
                     if p.magic not in MAGICS:
                         continue
                     fill_time.setdefault(p.ticket, p.time)
-                    if tick.time - fill_time[p.ticket] >= a.hold * 60:
+                    act, why = exit_decision(tick.time - fill_time[p.ticket], tick.bid,
+                                             p.price_open, a.hold, a.hold_green,
+                                             a.flat_hold, p.ticket in extended)
+                    if act == "extend":
+                        extended.add(p.ticket)
+                        log({"ts_utc": nowiso, "action": "HOLD-EXTEND", "server_day": day,
+                             "price": round(tick.bid, 3),
+                             "detail": f"[{MAGICS[p.magic]}] {p.ticket} green at {a.hold}min "
+                                       f"(bid {tick.bid:.3f} > fill {p.price_open:.3f}) — "
+                                       f"holding to {a.hold_green}min"})
+                    elif act == "close":
                         r = close_position(mt5, si, p)
                         log({"ts_utc": nowiso, "action": "TIME-EXIT", "server_day": day,
                              "price": round(tick.bid, 3),
-                             "detail": f"[{MAGICS[p.magic]}] closed {p.ticket} after "
-                                       f"{a.hold}min, retcode {getattr(r,'retcode','?')}"})
+                             "detail": f"[{MAGICS[p.magic]}] closed {p.ticket}: {why}, "
+                                       f"retcode {getattr(r,'retcode','?')}"})
 
             errors = 0                                # a healthy pass resets the backoff
             if a.once:
@@ -705,7 +772,7 @@ def main():
 
     # --- supervisor: never dies except on Ctrl-C; reconnects with backoff ---
     log({"ts_utc": _now(), "action": "START", "server_day": "",
-         "detail": f"{SYMBOL} exit={a.hold}min sl=-${a.protect} vol={a.volume} "
+         "detail": f"{SYMBOL} exit={exit_desc} sl=-${a.protect} vol={a.volume} "
                    f"boundary={a.day_boundary} {'DRY-RUN' if a.dry_run else 'LIVE'}"})
     try:
         while True:
