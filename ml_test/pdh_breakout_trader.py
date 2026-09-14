@@ -744,10 +744,12 @@ def main():
             # the only way the live rule can differ from the backtest, and only
             # on restarts.
             if not a.dry_run:
-                for p in (mt5.positions_get(symbol=SYMBOL) or []):
-                    if p.magic not in MAGICS:
-                        continue
+                open_pos = [p for p in (mt5.positions_get(symbol=SYMBOL) or []) if p.magic in MAGICS]
+                extended.intersection_update({p.ticket for p in open_pos})   # forget closed tickets
+                for p in open_pos:
                     fill_time.setdefault(p.ticket, p.time)
+                    if not (tick.bid > 0):
+                        continue                    # no usable bid this poll: decide next poll
                     act, why = exit_decision(tick.time - fill_time[p.ticket], tick.bid,
                                              p.price_open, a.hold, a.hold_green,
                                              a.flat_hold, p.ticket in extended)
