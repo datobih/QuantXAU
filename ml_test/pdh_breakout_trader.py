@@ -19,6 +19,20 @@ STRATEGY (as researched; see breakout-track memory) — TWO validated level stre
     - short-session guard: a UTC day with fewer than 62 minutes of session left
       at arming time (the winter Sunday reopen) is skipped for the PDH stream —
       the backtest excludes day-blocks under 62 M1 bars.
+    - OVERHEAD SKIP (DEFAULT since 2026-09-15; --no-overhead-skip disables):
+      the PDH stream is NOT armed when the prior week's high sits more than
+      0.5 x ATR14 above the PDH. Those breaks run straight into the bigger
+      level inside the hold and were net losers in every cell tested: FTMO
+      feed n=147 (28% of PDH trades) -$0.79/oz, 2021-23 -$0.73 and 2024-26
+      -$0.86; Exness n=131 -$0.44, both halves negative; family-wise
+      permutation p 0.02-0.03 (FTMO) across thresholds 0.25-1.5 ATR, plateau
+      0.5-0.75; a stale (two-weeks-old) high overhead is NOT harmful, so it is
+      the current weekly reference that matters. System effect: profit per
+      trade +55%, better every year, FTMO $10k pass rate at 0.10 lots
+      85% -> 94% with the same time to funded. ATR14 = mean high-low of the
+      last 14 completed UTC days INCLUDING the Sunday stubs — identical to the
+      backtest's daily resample, so the 0.5 threshold transfers as validated.
+      The PWH stream is unaffected.
   Exit — conditional time exit (DEFAULT since 2026-09-14) + disaster-SL:
     - at --hold minutes after the fill (default 60): if the bid is AT OR BELOW
       the fill price the position is closed (the trade is red — exactly the old
@@ -118,6 +132,8 @@ SMA_PERIOD = 10
 PROTECT_USD = 12.0        # disaster-SL distance ($/oz) - see docstring for validation
 HOLD_MIN = 60            # minute of the red check (and the flat exit under --flat-hold)
 HOLD_GREEN_MIN = 90      # trades above their fill price at HOLD_MIN are held to here
+ATR_PERIOD = 14          # daily ATR (mean high-low of completed UTC days) for the overhead rule
+OVERHEAD_ATR = 0.5       # skip the PDH stream when (PWH - PDH) > OVERHEAD_ATR * ATR14
 MAGIC = 770022            # daily PDH stream
 MAGIC_W = 770023          # weekly PWH stream (validated separately: +$2.55/oz, t=2.65)
 MAGICS = {MAGIC: "daily", MAGIC_W: "weekly"}
@@ -230,6 +246,8 @@ def daily_setup(mt5, expect_day=None):
     yday_close = float(completed[-1]["close"])
     sma10 = sum(closes[-SMA_PERIOD:]) / SMA_PERIOD
     today_high = float(rates[-1]["high"])       # forming day's high so far
+    rng = [float(r["high"]) - float(r["low"]) for r in completed[-ATR_PERIOD:]]
+    atr14 = sum(rng) / len(rng) if len(rng) == ATR_PERIOD else None
 
     def iso(ts):
         d = datetime.fromtimestamp(int(ts), timezone.utc).isocalendar()
@@ -252,9 +270,11 @@ def daily_setup(mt5, expect_day=None):
             if len(pre) >= SMA_PERIOD + 1:
                 sma_wk = sum(pre[-SMA_PERIOD:]) / SMA_PERIOD
                 pwh_gate = pre[-1] > sma_wk and float(first["open"]) < pwh
+    pwh_gap = (pwh - pdh) / atr14 if (pwh is not None and atr14) else None
     return {"pdh": pdh, "uptrend": yday_close > sma10, "sma10": sma10,
             "yday_close": yday_close, "today_high": today_high,
-            "pwh": pwh, "week_high": week_high, "pwh_gate": pwh_gate}
+            "pwh": pwh, "week_high": week_high, "pwh_gate": pwh_gate,
+            "atr14": atr14, "pwh_gap": pwh_gap}
 
 
 def _us_dst(ts_utc: float) -> bool:
@@ -290,14 +310,15 @@ def daily_setup_utc(mt5, offset_sec: int, expect_day=None):
         now_srv = int(rates[-1]["time"])
         winter = offset_sec - (3600 if _us_dst(now_srv - offset_sec) else 0)
         bar_off = lambda ts: winter + (3600 if _us_dst(ts - winter) else 0)
-    days: dict = {}                    # date -> [high, close, last_ts, first_open, first_ts]
+    days: dict = {}                    # date -> [high, close, last_ts, first_open, first_ts, low]
     for r in rates:
         rts = int(r["time"])
         ts = rts - bar_off(rts)
         d = datetime.fromtimestamp(ts, timezone.utc).date()
         rec = days.setdefault(d, [float(r["high"]), float(r["close"]), ts,
-                                  float(r["open"]), ts])
+                                  float(r["open"]), ts, float(r["low"])])
         rec[0] = max(rec[0], float(r["high"]))
+        rec[5] = min(rec[5], float(r["low"]))
         if ts >= rec[2]:
             rec[1], rec[2] = float(r["close"]), ts
         if ts < rec[4]:
@@ -313,6 +334,10 @@ def daily_setup_utc(mt5, offset_sec: int, expect_day=None):
     yday_close = days[completed[-1]][1]
     sma10 = sum(closes[-SMA_PERIOD:]) / SMA_PERIOD
     today_high = days[today][0]
+    # ATR14 over the last 14 completed UTC days, Sunday stubs included — the
+    # backtest's daily resample does exactly this, so OVERHEAD_ATR transfers
+    rng = [days[d][0] - days[d][5] for d in completed[-ATR_PERIOD:]]
+    atr14 = sum(rng) / len(rng) if len(rng) == ATR_PERIOD else None
     cur_week = today.isocalendar()[:2]
     prev_weeks = sorted({d.isocalendar()[:2] for d in completed
                          if d.isocalendar()[:2] != cur_week})
@@ -331,9 +356,18 @@ def daily_setup_utc(mt5, offset_sec: int, expect_day=None):
             if len(pre) >= SMA_PERIOD + 1:
                 sma_wk = sum(pre[-SMA_PERIOD:]) / SMA_PERIOD
                 pwh_gate = pre[-1] > sma_wk and days[wf][3] < pwh
+    pwh_gap = (pwh - pdh) / atr14 if (pwh is not None and atr14) else None
     return {"pdh": pdh, "uptrend": yday_close > sma10, "sma10": sma10,
             "yday_close": yday_close, "today_high": today_high,
-            "pwh": pwh, "week_high": week_high, "pwh_gate": pwh_gate}
+            "pwh": pwh, "week_high": week_high, "pwh_gate": pwh_gate,
+            "atr14": atr14, "pwh_gap": pwh_gap}
+
+
+def overhead_skip(pwh_gap, enabled: bool = True, threshold: float = OVERHEAD_ATR) -> bool:
+    """True when the PDH stream must NOT be armed: the prior week's high sits
+    more than `threshold` x ATR14 above the PDH. None (no PWH / no ATR yet)
+    never skips — the stream then behaves exactly as before the rule."""
+    return bool(enabled and pwh_gap is not None and pwh_gap > threshold)
 
 
 def cancel_stale_orders(mt5, offset_sec: int, cur_day: str, cur_week, force=False) -> None:
@@ -460,6 +494,9 @@ def main():
                          "and closed (default 90). Ignored with --flat-hold.")
     ap.add_argument("--flat-hold", action="store_true",
                     help="old spec: close every position at --hold minutes regardless of P&L")
+    ap.add_argument("--no-overhead-skip", action="store_true",
+                    help=f"arm the PDH stream even when the prior week's high sits more than "
+                         f"{OVERHEAD_ATR} x ATR14 above the PDH (default: skip those days)")
     ap.add_argument("--volume", type=float, default=VOLUME)
     ap.add_argument("--symbol", default="auto",
                     help="broker symbol name; 'auto' tries XAUUSDm then XAUUSD")
@@ -483,7 +520,8 @@ def main():
         if a.hold_green <= a.hold:
             raise SystemExit(f"--hold-green ({a.hold_green}) must be greater than --hold ({a.hold})")
         exit_desc = f"red at {a.hold}min -> close, else hold to {a.hold_green}min (validated 2026-09)"
-    print(f"exit: {exit_desc} | disaster-SL -${a.protect} "
+    skip_desc = "off (--no-overhead-skip)" if a.no_overhead_skip else f"on (PWH-PDH > {OVERHEAD_ATR} ATR14)"
+    print(f"exit: {exit_desc} | overhead skip: {skip_desc} | disaster-SL -${a.protect} "
           f"| vol {a.volume} | day-boundary {a.day_boundary} | dry_run={a.dry_run}\n")
 
     import datetime as _dt
@@ -673,6 +711,14 @@ def main():
                             log({**base, "action": "no-trade",
                                  "detail": f"PDH: only {(next_mid - eff) // 60}min of UTC day "
                                            "left (short session) — backtest excludes these"})
+                    elif overhead_skip(s.get("pwh_gap"), not a.no_overhead_skip):
+                        # validated rule (see docstring): the weekly high sits too
+                        # far overhead for a PDH break to run inside the hold
+                        if arm_tries == 0:
+                            log({**base, "action": "no-trade",
+                                 "detail": f"PDH: PWH {s['pwh']:.3f} sits {s['pwh_gap']:.2f} ATR14 "
+                                           f"({s['atr14']:.2f}) above PDH (> {OVERHEAD_ATR}) — "
+                                           "skipped (overhead rule)"})
                     else:
                         ok &= arm(s["pdh"], MAGIC, "PDH", s["today_high"], "today",
                                   s["uptrend"], "not an uptrend day", expiry_d)
@@ -774,8 +820,8 @@ def main():
 
     # --- supervisor: never dies except on Ctrl-C; reconnects with backoff ---
     log({"ts_utc": _now(), "action": "START", "server_day": "",
-         "detail": f"{SYMBOL} exit={exit_desc} sl=-${a.protect} vol={a.volume} "
-                   f"boundary={a.day_boundary} {'DRY-RUN' if a.dry_run else 'LIVE'}"})
+         "detail": f"{SYMBOL} exit={exit_desc} overhead-skip={skip_desc} sl=-${a.protect} "
+                   f"vol={a.volume} boundary={a.day_boundary} {'DRY-RUN' if a.dry_run else 'LIVE'}"})
     try:
         while True:
             try:
