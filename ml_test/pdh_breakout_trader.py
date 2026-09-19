@@ -33,6 +33,11 @@ STRATEGY (as researched; see breakout-track memory) — TWO validated level stre
       last 14 completed UTC days INCLUDING the Sunday stubs — identical to the
       backtest's daily resample, so the 0.5 threshold transfers as validated.
       The PWH stream is unaffected.
+    - SHADOW LEDGER (2026-09-19, logging only): one SHADOW row per arming with
+      days_since_20d_low and prior_week_higher_low (plus the overhead gap and
+      ATR14). Nothing is traded on them. Forward-test hypothesis: breaks that
+      fire 3-8 days after a fresh 20-day low, or after a lower weekly low, are
+      bounces rather than trends. Decide after ~1 year of live rows.
   Exit — conditional time exit (DEFAULT since 2026-09-14) + disaster-SL:
     - at --hold minutes after the fill (default 60): if the bid is AT OR BELOW
       the fill price the position is closed (the trade is red — exactly the old
@@ -222,6 +227,29 @@ def connect(mt5, allow_real: bool, require_trading: bool = True, terminal_path=N
     return si
 
 
+def shadow_features(lows, week_lows):
+    """SHADOW-LEDGER features (logged, never traded on — see 'FRESH-LOW' in the
+    docstring). lows: completed daily lows, chronological. week_lows: completed
+    ISO weeks' lows, chronological (the current, forming week excluded).
+      days_since_20d_low : completed days since the most recent day whose low
+                           was at/below the minimum low of the 20 days before
+                           it (0 = yesterday was such a day); None if fewer
+                           than 21 completed days; capped at 60.
+      prior_week_higher_low : prior completed week's low > the week before's
+                           low (True/False); None if fewer than 2 weeks."""
+    dsl = None
+    if len(lows) >= 21:
+        dsl = 60
+        for j in range(len(lows) - 1, 19, -1):
+            if lows[j] <= min(lows[j - 20:j]):
+                dsl = min(len(lows) - 1 - j, 60)
+                break
+    hl = None
+    if len(week_lows) >= 2:
+        hl = bool(week_lows[-1] > week_lows[-2])
+    return {"days_since_20d_low": dsl, "prior_week_higher_low": hl}
+
+
 def daily_setup(mt5, expect_day=None):
     """Daily + weekly levels from D1 bars. Returns dict or None.
     expect_day: the trading day (date) the caller is arming. If the feed's
@@ -233,7 +261,7 @@ def daily_setup(mt5, expect_day=None):
     pwh = prior COMPLETED ISO-week's high; week_high = this week's high so far
     (completed days this week + the forming day) — the restart-proof
     one-trade-per-week guard."""
-    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_D1, 0, max(SMA_PERIOD + 3, 25))
+    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_D1, 0, 90)   # 90 D1 bars: shadow ledger needs 81 completed days
     if rates is None or len(rates) < SMA_PERIOD + 2:
         return None
     if expect_day is not None:
@@ -271,10 +299,17 @@ def daily_setup(mt5, expect_day=None):
                 sma_wk = sum(pre[-SMA_PERIOD:]) / SMA_PERIOD
                 pwh_gate = pre[-1] > sma_wk and float(first["open"]) < pwh
     pwh_gap = (pwh - pdh) / atr14 if (pwh is not None and atr14) else None
+    wl = {}
+    for r in completed:
+        w = iso(r["time"])
+        if w != cur_week:
+            wl[w] = min(wl.get(w, float("inf")), float(r["low"]))
+    shadow = shadow_features([float(r["low"]) for r in completed],
+                             [wl[w] for w in sorted(wl)])
     return {"pdh": pdh, "uptrend": yday_close > sma10, "sma10": sma10,
             "yday_close": yday_close, "today_high": today_high,
             "pwh": pwh, "week_high": week_high, "pwh_gate": pwh_gate,
-            "atr14": atr14, "pwh_gap": pwh_gap}
+            "atr14": atr14, "pwh_gap": pwh_gap, "shadow": shadow}
 
 
 def _us_dst(ts_utc: float) -> bool:
@@ -301,7 +336,10 @@ def daily_setup_utc(mt5, offset_sec: int, expect_day=None):
     US DST, so bars from before the latest switch are off by an hour if shifted
     with today's offset (audit caught this: SMA10 drifted for ~2 weeks after
     each switch). offset 0 = fixed-UTC broker (Exness), no DST anywhere."""
-    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, 800)
+    # 2400 H1 bars (~100 calendar days): the levels need ~35 days, the shadow
+    # ledger's days_since_20d_low needs 60 + 20 days of lows to match the
+    # backtest definition (audit 2026-09-19: 800 bars capped it at 60 on 15/40 days)
+    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, 2400)
     if rates is None or len(rates) < (SMA_PERIOD + 3) * 20:
         return None
     if offset_sec == 0:
@@ -357,10 +395,16 @@ def daily_setup_utc(mt5, offset_sec: int, expect_day=None):
                 sma_wk = sum(pre[-SMA_PERIOD:]) / SMA_PERIOD
                 pwh_gate = pre[-1] > sma_wk and days[wf][3] < pwh
     pwh_gap = (pwh - pdh) / atr14 if (pwh is not None and atr14) else None
+    wl = {}
+    for d in completed:
+        w = d.isocalendar()[:2]
+        if w != cur_week:
+            wl[w] = min(wl.get(w, float("inf")), days[d][5])
+    shadow = shadow_features([days[d][5] for d in completed], [wl[w] for w in sorted(wl)])
     return {"pdh": pdh, "uptrend": yday_close > sma10, "sma10": sma10,
             "yday_close": yday_close, "today_high": today_high,
             "pwh": pwh, "week_high": week_high, "pwh_gate": pwh_gate,
-            "atr14": atr14, "pwh_gap": pwh_gap}
+            "atr14": atr14, "pwh_gap": pwh_gap, "shadow": shadow}
 
 
 def overhead_skip(pwh_gap, enabled: bool = True, threshold: float = OVERHEAD_ATR) -> bool:
@@ -660,6 +704,20 @@ def main():
                     base = {"ts_utc": nowiso, "server_day": day, "pdh": round(s["pdh"], 3),
                             "sma10": round(s["sma10"], 3), "yday_close": round(s["yday_close"], 3),
                             "uptrend": s["uptrend"], "price": round(price, 3)}
+                    if arm_tries == 0:
+                        # SHADOW LEDGER (2026-09-19): features logged for a
+                        # forward test, NOT acted on. Hypothesis: a break that
+                        # fires 3-8 days after a fresh 20-day low, or in a week
+                        # following a lower weekly low, is a bounce rather than
+                        # a trend (backtest cells -$0.8/-$0.6 and +$0.4/+$1.2
+                        # vs +$2.4..+$2.9 elsewhere, n~70 each, family-wise p
+                        # 0.28-0.60 — unproven). Revisit after ~1 year of rows.
+                        sh = s.get("shadow") or {}
+                        log({**base, "action": "SHADOW",
+                             "detail": f"days_since_20d_low={sh.get('days_since_20d_low')} "
+                                       f"prior_week_higher_low={sh.get('prior_week_higher_low')} "
+                                       f"pwh_gap_atr={s['pwh_gap'] if s.get('pwh_gap') is None else round(s['pwh_gap'], 3)} "
+                                       f"atr14={s['atr14'] if s.get('atr14') is None else round(s['atr14'], 2)}"})
 
                     def arm(level, magic, tag, high_guard, guard_name,
                             gate_ok, gate_msg, expiry_ts):
